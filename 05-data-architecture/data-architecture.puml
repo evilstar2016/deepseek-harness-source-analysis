@@ -1,0 +1,157 @@
+@startuml data-architecture
+!theme plain
+skinparam backgroundColor white
+skinparam classBackgroundColor #E3F2FD
+skinparam classBorderColor #1976D2
+skinparam arrowColor #424242
+skinparam componentStyle rectangle
+skinparam package {
+  BackgroundColor LightGray
+  FontColor Blue
+}
+skinparam component {
+  BackgroundColor LightBlue
+  BorderColor Black
+  ArrowColor Black
+  FontColor DarkBlue
+}
+
+title DeepSeek Harness 数据架构组件图
+
+' ===== L1 核心层：事件流（权威） =====
+package "L1 核心层：事件流（权威）" as L1 #E8F5E9 {
+  component "Session\n(index.ts:424)" as Session
+  component "SessionStore\n(index.ts:791)" as SessionStore
+  component "SessionEventMap\n(types.ts:235)\n13 个事件类型" as EventMap
+  component "SessionHeader\n(types.ts:60)" as Header
+  component "SessionEvent\n(types.ts:403)\n信封: type/seq/time/data" as Event
+}
+
+' ===== L2 派生层 =====
+package "L2 派生层（从事件流折叠）" as L2 #FFF3E0 {
+  component "deriveMessages()\n派生模型历史" as DeriveMsg
+  component "SessionProjectionRegistry\n(init/apply/view 纯函数)" as Projection
+  component "SessionProjectionCache\n(session_projcache domain)" as ProjCache
+  component "SessionCorpus\nlive-preferred 逻辑语料" as Corpus
+}
+
+' ===== L3 持久化协调层 =====
+package "L3 持久化协调层" as L3 #E3F2FD {
+  component "PersistenceCoordinator\n(coordinator.ts)\n编排: 缓冲/序列化/采纳/修复" as Coordinator
+  component "SessionWriteBehind\n(write-behind.ts)\n200ms 写后批合并" as WriteBehind
+  component "PersistenceBackend\n(interface)" as BackendIface
+}
+
+' ===== L3 持久化后端层 =====
+package "L3 持久化后端层（双后端）" as L3b #E3F2FD {
+  component "JsonlSessionPersistence\n(jsonl/index.ts:121)\n追加只写文件 + 写透发布" as JsonlBackend
+  component "SqliteSessionPersistence\n(sqlite/index.ts:99)\n3 表: persistence_state/sessions/events" as SqliteBackend
+}
+
+' ===== L4 检索层 =====
+package "L4 检索层（FTS 派生索引）" as L4 #F3E5F5 {
+  component "SessionQueryEngine\n(query-sqlite/index.ts:196)" as QueryEngine
+  component "persisted_docs\n(FTS5, unicode61)" as FtsPersisted
+  component "temp.live_docs\n(FTS5, 临时)" as FtsLive
+  component "search_state / persisted_sessions\n(search_state schema)" as QueryState
+}
+
+' ===== L4 辅助存储层 =====
+package "L4 辅助存储层" as L4b #FFEBEE {
+  component "attachment-local\n(store.ts)\n内容寻址 sha256:hex" as Attachment
+  component "storage / storage-domain\nKvFacet + DomainSpec" as Storage
+  component "spill-local\n(store.ts)\n会话作用域临时文件" as Spill
+  component "settings-file\n(settings.yaml)\n保留叶子级 diff" as Settings
+  component "credentials-local\n(.credentials.yaml)\n分层信任 引用语义" as Credentials
+}
+
+' ===== 外部介质 =====
+package "外部介质" as Media #FAFAFA {
+  file "**JSONL 文件**\n[root]/[project]/[id]/\nsession.jsonl.zstd\n(header + event lines)" as JsonlFile
+  database "**SQLite 数据库**\nSCHEMA_VERSION=15\nAPPLICATION_ID=0x44534850\nWAL journal" as SqliteDb
+  database "**派生检索索引**\nSCHEMA_VERSION=8\nAPPLICATION_ID=0x44534851\n(disposable)" as QueryDb
+  file "**附件对象**\nattachments/v1/objects/\n[sha256前2位]/[sha256]" as AttFile
+  file "**KV 单元**\nstorage-json | storage-sqlite" as KvFile
+  file "**spill 文件**\n[tmp]/dsh-spill-[rand]/\nsession-[hash12]/" as SpillFile
+  file "**settings.yaml**\n[DSH_HOME]/" as SettingsFile
+  file "**.credentials.yaml**\n[DSH_HOME]/ (0600)" as CredFile
+}
+
+' ===== L1 内部关系 =====
+SessionStore --> Session : create/prepare/fork
+Session --> Event : append (seq=log.length)
+Session --> Header : 持有不可变头
+Event --> EventMap : data: SessionEventMap[K]
+
+' ===== L1 -> L2 派生 =====
+Session --> DeriveMsg : 派生模型历史
+Session --> Projection : session/event 回调
+Projection --> ProjCache : 节流检查点
+Session --> Corpus : live 快照
+
+' ===== L1 -> L3 持久化 =====
+Session --> Coordinator : append 事件
+Coordinator --> WriteBehind : enqueue(batch)
+WriteBehind --> BackendIface : write(batch) after 200ms
+
+' ===== L3 后端实现 =====
+BackendIface ..> JsonlBackend : "实现"
+BackendIface ..> SqliteBackend : "实现"
+
+' ===== L3 -> 介质 =====
+JsonlBackend --> JsonlFile : materialize/appendLines\n+ 写透发布
+SqliteBackend --> SqliteDb : BEGIN/COMMIT 事务
+
+' ===== L2/L3 -> L4 检索 =====
+Corpus --> QueryEngine : listSessions/load/projectMany
+Coordinator --> QueryEngine : listSnapshots (revision)
+QueryEngine --> FtsPersisted : 索引持久化会话
+QueryEngine --> FtsLive : 索引 live 会话
+QueryEngine --> QueryState : 状态/元数据
+QueryEngine --> QueryDb : openSearchDatabase\n(SCHEMA_VERSION=8)
+
+' ===== L4 辅助存储 =====
+Attachment --> AttFile : saveImageFile/readImageFile\nlink()+fsync 目录
+Storage --> KvFile : KvFacet.open/putRecord
+Spill --> SpillFile : saveTextFile (wx, 0600)
+Settings --> SettingsFile : patchNode + withFileLock
+Credentials --> CredFile : 分层 + assertOwnerOnly
+
+' ===== 跨层关系 =====
+ProjCache --> Storage : session_projcache domain
+JsonlBackend ..> Header : 读写 SessionHeader
+SqliteBackend ..> Header : 读写 SessionHeader
+
+' ===== 注释 =====
+note right of BackendIface
+  **接口契约**:
+  loadStored / readStoredRevision
+  loadStoredFrom? (seek-capable)
+  appendBatch / commitRepair / list
+  双后端崩溃语义一致
+end note
+
+note right of JsonlFile
+  **写透发布**:
+  POSIX: link() + syncDirPosix
+  Windows: MoveFileExW(MOVEFILE_WRITE_THROUGH)
+  撕裂尾: SessionLogScanner
+end note
+
+note right of SqliteDb
+  **撕裂尾修复**:
+  scanRows: 最后 turn/end 之后的洞容忍
+  commitRepair: DELETE + INSERT in one tx
+  loadStoredFrom: SELECT WHERE seq >= fromSeq
+end note
+
+note bottom of L4b
+  **辅助存储特性**:
+  - 附件: 内容寻址 + dedup
+  - storage: KV facet + domain spec
+  - spill: 私有 0700 + 不可预测路径
+  - settings: 保留 diff + 热重载
+  - credentials: 引用语义 + 0600
+end note
+
+@enduml

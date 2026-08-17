@@ -1,0 +1,88 @@
+@startuml 01-tool-execution-sequence
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowColor #1976D2
+skinparam sequenceActorBorderColor #426450ff
+skinparam sequenceParticipantBorderColor #6C757D
+skinparam SequenceParticipantBorderThickness 2
+skinparam sequenceLifeLineBorderColor #9bd0f5ff
+skinparam noteBackgroundColor #FFF3E0
+skinparam noteBorderColor #F57C00
+skinparam style strictuml
+skinparam Padding 6
+skinparam ParticipantPadding 25
+
+title 工具执行管线：三阶段调度
+
+actor "AgentLoop" as Loop
+participant "ToolRuntime\n(ctx.tools L786)" as Runtime
+participant "ToolLayer\n(L713)" as Layer
+participant "审批/策略\n(interaction/)" as Policy
+database "Session\n(事件日志)" as Session
+participant "Consumer 工具\n(shell/fs/web...)" as Tool
+
+Loop -> Runtime: tool/call (来自模型)
+activate Runtime
+
+== 分类阶段 ==
+Runtime -> Runtime: executionMode (L1275)
+note right of Runtime
+  按执行模式分类：
+  同步 / 异步 / barrier / concluding
+end note
+Runtime -> Runtime: createExecution (L1363)
+activate Runtime #LightBlue
+
+== Pre-execute 阶段 ==
+Runtime -> Policy: tools/pre-execute (waterfall)
+activate Policy
+note right of Policy
+  策略注入
+  审批检查
+  限制检查 (restrict L1070)
+end note
+Policy --> Runtime: 允许 | 拒绝 | 修改
+deactivate Policy
+
+alt 拒绝
+  Runtime -> Session: append(tool/result) 失败
+else 允许执行
+  Runtime -> Session: append(tool/call)
+
+  == Execute 阶段（并发） ==
+  Runtime -> Runtime: dispatchToolBody (L1531)
+  note right of Runtime
+    barrier + 有界滚动池
+    maxParallelSubCalls 控制并发
+    pre 有序 / execute 并发 / post 有序
+  end note
+
+  Runtime -> Tool: 并发调用工具体
+  activate Tool
+  Tool -> Tool: 执行实际操作
+  Tool --> Runtime: ToolExecutionResult
+  deactivate Tool
+
+  == Post-execute 阶段 ==
+  Runtime -> Runtime: postExecute (L1741)
+  Runtime -> Runtime: fuseToolSignals (L1888)
+  note right of Runtime
+    信号融合
+    结果规范化
+  end note
+  Runtime -> Session: append(tool/result)
+end
+
+Runtime -> Runtime: notifyResult (L1656)
+Runtime --> Loop: 工具结果
+deactivate Runtime
+deactivate Runtime
+
+note over Loop, Tool
+  三阶段管线特点：
+  1. pre-execute 是 waterfall（策略/审批可拦截）
+  2. execute 并发，受 barrier 与滚动池控制
+  3. post-execute 是 waterfall（结果后处理）
+  4. 所有 tool/call 与 tool/result 持久到会话日志
+end note
+@enduml

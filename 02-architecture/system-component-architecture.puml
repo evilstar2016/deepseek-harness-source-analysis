@@ -1,0 +1,231 @@
+@startuml system-component-architecture
+!theme plain
+skinparam componentStyle rectangle
+skinparam backgroundColor white
+skinparam Package {
+  BackgroundColor LightGray
+  FontColor Blue
+}
+skinparam component {
+  BackgroundColor LightBlue
+  BorderColor Black
+  ArrowColor Black
+  FontColor DarkBlue
+}
+skinparam note {
+  backgroundColor LightYellow
+}
+skinparam Padding 4
+skinparam nodesep 40
+skinparam ranksep 50
+
+title DeepSeek Harness (dsh) 系统组件架构
+
+' ============ 应用入口层 ============
+package "应用入口 (apps/)" as Apps {
+  [dsh CLI\napps/cli/src/bin.ts] as CLI
+  [Web UI 前端\napps/web (Vite)] as WebUI
+}
+
+' ============ Boot 组合层 ============
+package "Boot 组合层 (boot/)" as Boot {
+  [app-boot\nprofile/bundle 层组合] as AppBoot
+  [cmdline\n命令行解析] as Cmdline
+}
+
+' ============ Profile Bundle 层 ============
+package "Profile Bundle (bundle/)" as Bundles {
+  [dsh-base\n模型/工具/持久化/沙箱/审批] as BaseBundle
+  [dsh-web-app\n浏览器应用层] as WebBundle
+  [dsh-headless\n无服务器一次性运行] as HeadlessBundle
+}
+
+' ============ Host / Client 双半 ============
+package "Web-GUI (host/ + client/)" as Gui {
+  [host\nAPI 网关 + HTTP 路由] as Host
+  [client\n浏览器 shell + ui-* 插件] as Client
+}
+
+' ============ Core API 主干 ============
+package "Core API 主干 (core/) — 稳定 API" as Core {
+  [session\nSessionEvent 日志 + Store\nctx.sessions] as CoreSession
+  [agent\nAgent 接口 + 注册表\nctx.agents] as CoreAgent
+  [agent-loop\n默认驱动 AgentLoop\nctx.agentLoop] as AgentLoop
+  [tools\n工具注册表 + 执行管线\nctx.tools] as CoreTools
+  [system-prompt\nPrompt + schema 装配\nctx.systemPrompt] as SysPrompt
+  [scope\nper-agent 作用域注册] as Scope
+}
+
+' ============ LLM 能力 ============
+package "LLM 能力 (llm/)" as LLM {
+  [llm\n消息/流词汇 + 适配器接缝\nctx.llm] as LlmSeam
+  [llm-deepseek\nDeepSeek 适配器] as LlmDeepseek
+  [llm-pi-ai\n可选 pi-ai 后端] as LlmPiAi
+  [token-meter\nToken 计量] as TokenMeter
+}
+
+' ============ 执行环境能力接缝 ============
+package "执行环境能力接缝" as ExecCaps {
+  [shell\nctx.shell] as Shell
+  [subprocess\nctx.subprocess] as Subprocess
+  [terminal\nctx.terminals] as Terminal
+  [code-runtime\nworker-thread] as CodeRuntime
+  [sandbox\nctx.sandbox\nbwrap/Landlock/Seatbelt] as Sandbox
+  [fs\nctx.fs + 策略] as Fs
+  [lsp\n语言服务器] as Lsp
+  [e2b\n远程沙箱 POC] as E2b
+}
+
+' ============ 模型协作能力接缝 ============
+package "模型协作能力接缝" as CoopCaps {
+  [skill\nprovider + catalog] as Skill
+  [web\nsearch/fetch] as Web
+  [compaction\n上下文压缩] as Compaction
+  [context\n请求上下文] as Context
+  [subagent\n委派] as Subagent
+  [jobs\nctx.jobs] as Jobs
+  [workflow\nralph] as Workflow
+  [todo\ntodo_write] as Todo
+  [plan\n计划状态] as Plan
+  [guard\n循环卫生 + 超时] as Guard
+  [extensions\n运行时自修改] as Extensions
+}
+
+' ============ 持久化与检索 ============
+package "持久化与检索" as Persist {
+  [session\nJSONL/SQLite 后端 + 投影] as SessionPersist
+  [session-query\nFTS + lineage] as SessionQuery
+  [storage\n非会话存储 hub] as Storage
+  [attachment\n内容寻址存储] as Attachment
+  [settings\n文件 provider] as Settings
+  [credentials\nenv/.env provider] as Credentials
+}
+
+' ============ 协议与集成 ============
+package "协议与集成" as Proto {
+  [api\ngateway + remotes] as Api
+  [typert\ngenerator+loader+registry] as Typert
+  [sdk\nJSON-RPC client/server] as Sdk
+  [acp\nACP server] as Acp
+  [hooks\nClaude/Codex 桥] as Hooks
+  [interaction\n审批/权限/命令] as Interaction
+}
+
+' ============ vendored 框架 ============
+package "vendored Cordis (vendor/)" as Vendor {
+  [cordis\n插件/上下文框架] as Cordis
+  [cosmokit] as Cosmokit
+  [schemastery] as Schemastery
+}
+
+' ============ 外部服务 ============
+database "DeepSeek API" as DeepSeekAPI
+database "SQLite / JSONL\n(会话日志)" as DB
+database "E2B 沙箱" as E2BCloud
+cloud "本地文件系统 / PTY" as LocalFS
+
+' ============ 依赖关系 ============
+
+' 应用入口 -> Boot
+CLI --> Cmdline
+CLI --> AppBoot
+WebUI --> Host
+
+' Boot -> Bundle
+AppBoot --> BaseBundle
+AppBoot --> WebBundle
+AppBoot --> HeadlessBundle
+
+' Bundle -> Core + Caps
+BaseBundle --> Core
+BaseBundle --> LLM
+BaseBundle --> ExecCaps
+BaseBundle --> Persist
+BaseBundle --> Interaction
+WebBundle --> Host
+HeadlessBundle --> AgentLoop
+
+' Host/Client
+Host --> Api
+Host --> CoreSession
+Client --> Sdk
+
+' Core 内部依赖
+AgentLoop --> CoreSession
+AgentLoop --> SysPrompt
+AgentLoop --> LlmSeam
+AgentLoop --> CoreTools
+AgentLoop --> CoreAgent
+CoreTools --> Scope
+CoreAgent --> Scope
+SysPrompt --> CoreTools
+
+' LLM
+LlmSeam <-- LlmDeepseek
+LlmSeam <-- LlmPiAi
+LlmDeepseek --> DeepSeekAPI
+
+' 执行能力 -> 外部
+Shell --> Subprocess
+Subprocess --> Sandbox
+Terminal --> Subprocess
+Fs --> LocalFS
+Shell --> LocalFS
+E2b --> E2BCloud
+CodeRuntime --> Sandbox
+
+' 工具通过 CoreTools 注册
+CoreTools <-- Shell
+CoreTools <-- Fs
+CoreTools <-- Terminal
+CoreTools <-- Web
+CoreTools <-- Skill
+CoreTools <-- Todo
+CoreTools <-- Subagent
+CoreTools <-- Jobs
+
+' 持久化
+CoreSession --> SessionPersist
+SessionPersist --> DB
+SessionQuery --> DB
+SessionQuery --> CoreSession
+
+' 协议
+Api --> Typert
+Api --> CoreSession
+Sdk --> CoreSession
+Acp --> AgentLoop
+Hooks --> AgentLoop
+
+' 所有包依赖 Cordis
+Core ..> Cordis
+LLM ..> Cordis
+ExecCaps ..> Cordis
+CoopCaps ..> Cordis
+Persist ..> Cordis
+Proto ..> Cordis
+Cordis --> Cosmokit
+Cordis --> Schemastery
+
+note right of Core
+  一切皆插件：无特权核心
+  注册是可逆 effect (ctx.effect/ctx.on)
+  register() 返回 disposer
+end note
+
+note right of ExecCaps
+  能力接缝三角色：
+  Service Definition + Provider + Consumer
+  换一个 provider 即迁移整个执行世界
+end note
+
+note bottom of AgentLoop
+  Turn/Step 生命周期：
+  turn/start → claim → agent/pre-step(瀑布)
+  → step/start → agent/request → llm/stream
+  → assistant/* → tool/call* → tools/*(瀑布)
+  → tool/result* → step/end
+  → agent/turn-stopping(串行) → turn/end
+end note
+
+@enduml

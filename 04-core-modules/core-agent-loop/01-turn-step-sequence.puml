@@ -1,0 +1,95 @@
+@startuml 01-turn-step-sequence
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowColor #1976D2
+skinparam sequenceActorBorderColor #426450ff
+skinparam sequenceParticipantBorderColor #6C757D
+skinparam SequenceParticipantBorderThickness 2
+skinparam sequenceLifeLineBorderColor #9bd0f5ff
+skinparam noteBackgroundColor #FFF3E0
+skinparam noteBorderColor #F57C00
+skinparam style strictuml
+skinparam Padding 6
+skinparam ParticipantPadding 25
+
+title Turn/Step 生命周期（AgentLoop 默认驱动）
+
+actor 用户 as User
+participant "AgentLoop\n(agent-loop L295)" as Loop
+participant "Inbox\n(agent)" as Inbox
+participant "systemPrompt\n(ctx.systemPrompt)" as Prompt
+participant "LLM\n(ctx.llm)" as LLM
+participant "ToolRuntime\n(ctx.tools L786)" as Tools
+participant "Session\n(ctx.sessions)" as Session
+participant "Hook 监听者" as Hooks
+
+User -> Loop: followup(content)
+Loop -> Inbox: 排队消息
+Loop -> Session: turn/start
+
+== claim 阶段 ==
+Loop -> Inbox: claim 下一 step 输入 + 一条消息
+Inbox --> Loop: claimed messages
+
+Loop -> Hooks: agent/pre-step (waterfall)
+activate Hooks
+note right of Hooks
+  可重写 claimed 消息
+  或直接拒绝
+end note
+Hooks --> Loop: reject | enter(messages)
+deactivate Hooks
+
+alt 拒绝 / 首次 enter 重写为空
+  Loop -> Session: 无 step 关闭 turn
+else enter 提议步骤
+  Loop -> Session: step/start
+  Loop -> Session: append(user/message) per entered
+
+  == 模型请求阶段 ==
+  Loop -> Prompt: system-prompt/assemble (waterfall)
+  Prompt --> Loop: prompt sections + tool schemas
+  Loop -> Session: deriveMessages()
+  Session --> Loop: model history
+
+  Loop -> Hooks: agent/request (waterfall)
+  Loop -> LLM: llm/stream (waterfall)
+  activate LLM
+  LLM --> Loop: StreamChunk*
+  Loop -> Session: append(assistant/chunk)*
+  LLM --> Loop: final message
+  deactivate LLM
+  Loop -> Session: append(assistant/message)
+
+  == 工具执行阶段 ==
+  Loop -> Tools: 分类 pending call (executionMode)
+  loop barriers + 有界滚动池
+    opt call 开始
+      Loop -> Session: append(tool/call)
+      Loop -> Tools: tools/pre-execute (waterfall)
+      Tools -> Tools: 并发 execute
+      Tools -> Tools: tools/post-execute (waterfall)
+    end
+    opt 结果就绪
+      Loop -> Session: append(tool/result)
+    end
+  end
+
+  Loop -> Session: step/end
+
+  opt 自然停止 + inbox 空
+    Loop -> Hooks: agent/turn-stopping (serial, 无 next)
+    note right of Hooks
+      权威终端检查点
+      无 next() 委托
+    end note
+  end
+
+  opt 下一 step 输入待处理
+    Loop -> Loop: claim 下一 step 输入
+  end
+end
+
+Loop -> Session: turn/end
+Loop --> User: agent/status idle
+@enduml

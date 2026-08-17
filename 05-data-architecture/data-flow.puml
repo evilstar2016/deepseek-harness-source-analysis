@@ -1,0 +1,245 @@
+@startuml data-flow
+!theme plain
+skinparam backgroundColor white
+skinparam classBackgroundColor #E3F2FD
+skinparam classBorderColor #1976D2
+skinparam arrowColor #424242
+
+title DeepSeek Harness 数据流程图
+
+' ===== 6.1 事件追加 -> 派生 -> 持久化 -> 检索 =====
+|事件追加主流程|
+start
+
+:agent loop 产生事件;
+
+:Session.append(type, data, surfaceIntent);
+note right
+  **不变式校验**:
+  1. snapshotJsonValue(data) - JSON 可序列化
+  2. assertSupportedRequestHeader
+  3. snapshotJsonValue(surfaceMetadata)
+  4. entry.appending 重入保护
+  5. deepFreeze(event)
+  6. surfaceManager.validateNext
+end note
+
+:log.push(event) - 权威日志追加;
+:eventsSnapshot = undefined - 失效缓存;
+:session/event 回调分发;
+
+fork
+  :SessionProjectionRegistry.apply(state, event);
+  note right
+    **投影折叠**:
+    - init/apply/view 纯函数
+    - apply 返回同引用 - 零下游工作
+    - whole-value event 规则
+  end note
+  :SessionProjectionCache 节流写;
+  note right
+    **触发器**:
+    - writeEveryEvents 计数
+    - writeIntervalMs 间隔
+    - turn/end (强制)
+    - disposal (强制)
+    **fail-soft**: 失败仅 warning
+  end note
+  :storage domain session_projcache;
+fork again
+  :SessionWriteBehind.enqueue(event);
+  note right
+    **写后批合并**:
+    - structuredClone(event)
+    - pending.push
+    - armTimer(200ms)
+  end note
+
+  :deadline 或 flush 触发;
+  :PersistenceBackend.appendBatch(meta, events, isMaterialized);
+
+  fork
+    :SQLite 后端;
+    :BEGIN;
+    if (isMaterialized?) then (否)
+      :writeRow(meta) - INSERT sessions;
+      :incarnation=randomUUID();
+    endif
+    :逐行 INSERT events (envelopeBindings);
+    :UPDATE sessions SET revision=revision+1;
+    :COMMIT;
+  fork again
+    :JSONL 后端;
+    if (isMaterialized?) then (否)
+      :materialize;
+      note right
+        **写透发布**:
+        POSIX: mkdir 0700 + syncDirPosix
+          + writeSyncedTempFile (wx, 0600)
+          + link() + syncDirPosix(dir)
+        Windows: ensureDurableDirectoryWin32
+          + publishNewFileWin32
+          (MoveFileExW MOVEFILE_WRITE_THROUGH)
+      end note
+    else (是)
+      :appendLines;
+      note right
+        **追加+fsync+回滚**:
+        open(a) -> writeFile -> sync
+        失败: rollbackAppend (truncate before)
+      end note
+    endif
+  end fork
+end fork
+
+|检索流程|
+:SessionQueryEngine.searchSessions / searchEvents;
+:SessionCorpus.listSessions;
+note right
+  **live-preferred 语料**:
+  live session 优先
+  可选后端故障不影响内存读
+end note
+
+:buildSessionWhere / buildEventWhere;
+note right
+  **参数化 SQL**:
+  - assertFts5OuterPredicateCount (<=14)
+  - assertPortableBindingCount (<=32766)
+end note
+
+:SELECT FROM live_docs/persisted_docs;
+:WHERE filters AND docs MATCH ?;
+:makeSnippet (FTS5 highlight);
+:SessionSearchPage / SessionEventSearchPage;
+stop
+
+' ===== 6.2 会话分叉 =====
+|会话分叉 (fork)|
+start
+:SessionStore.fork(source, boundary, childSessionId);
+
+if (childSessionId 已存在?) then (是)
+  :throw SESSION_ALREADY_EXISTS;
+  stop
+endif
+
+:_resolveForkSource(source) -> live Session;
+:_forkSeed(liveSource, boundary) -> 种子事件前缀;
+:create(childSessionId, seed, meta);
+
+:Session.create(id, seed, header);
+:log = seed 数组 (种子事件成为子日志前缀);
+:firstLiveSeq = seed.length (种子边界);
+
+:首次 append;
+:append session/end-seed 标记种子结束;
+note right
+  **种子边界耐久化**:
+  - 此事件之前来自种子
+  - 此生命周期不产出
+  - 位置+time 承载含义
+  - resume/replay 据此区分父子
+end note
+
+:后续事件 = 子生命周期产出;
+stop
+
+' ===== 6.3 会话恢复 (resume) =====
+|会话恢复 (resume)|
+start
+:SessionStore.prepare(id, seedSource=persistence);
+:Session.fromRestore(id, seed, meta);
+:PersistenceCoordinator.load(id);
+:PersistenceBackend.loadStored(id);
+
+fork
+  :SQLite;
+  :SELECT sessions row + events ORDER BY seq;
+  :scanRows(eventRows) -> preserved + tornFrom;
+fork again
+  :JSONL;
+  :readFile(logPath);
+  :scanLog(buffer);
+  note right
+    SessionLogScanner:
+    - parseHeaderRecord (refuseForeignFormatVersion)
+    - write(chunk) 增量扫描
+    - consumeEventLine (seq 间隙检测)
+    - finish (忽略无尾换行的撕裂尾)
+  end note
+end fork
+
+if (tornMarker?) then (是)
+  :commitRepair(meta, tornMarker, closers);
+  note right
+    **修复**:
+    SQLite: DELETE WHERE seq>=tornMarker
+            + INSERT closers (one tx)
+    JSONL:  truncate(offset) + fsync
+            + appendLines(closers)
+  end note
+endif
+
+:返回 StoredPrefix (meta, events, revision);
+:adoptSessionEvent(events);
+:Session 构造器 (log=events, firstLiveSeq=最后 session/end-seed);
+:SessionStore.enter (live 注册);
+stop
+
+' ===== 6.4 FTS 索引同步 =====
+|FTS 索引同步|
+start
+:SqliteSessionQueryEngine 观察期;
+
+fork
+  :live 会话观察;
+  :SessionCorpus.listSessions -> live 集合;
+  :buildSessionEventSearchDocuments(session);
+  :REPLACE temp.live_sessions;
+  :REPLACE temp.live_docs (FTS5);
+fork again
+  :持久化会话观察;
+  :Persistence.listSnapshots -> revision 集合;
+  :比对已索引 revision;
+  if (revision 变更?) then (是)
+    :inspectPersisted(id);
+    :buildSessionEventSearchDocuments;
+    :REPLACE persisted_sessions;
+    :REPLACE persisted_docs (FTS5);
+  endif
+end fork
+
+:global_generation++ (search_state);
+stop
+
+' ===== 6.5 崩溃恢复流程 =====
+|崩溃恢复 (crash tail repair)|
+start
+:进程崩溃 (撕裂尾存在);
+:重启后 load(id);
+:扫描事件行 (scanRows / SessionLogScanner);
+
+:找最后 turn/end;
+if (最后 turn/end 之后有洞?) then (是)
+  :容忍为撕裂尾;
+  :tornFrom = 保留前缀之后第一 seq;
+else (否)
+  if (最后 turn/end 之前有洞?) then (是)
+    :抛错 (已提交损坏);
+    stop
+  endif
+endif
+
+:commitRepair (截断撕裂尾 + 合成关闭器);
+note right
+  **语义一致** (双后端):
+  - 已提交区 (turn/end 之前) 洞 = 损坏
+  - 撕裂尾 (turn/end 之后) 洞 = 容忍
+  - 物理删除 tornFrom 之后 + 追加 closers
+end note
+
+:存储日志 = 平衡日志;
+stop
+
+@enduml

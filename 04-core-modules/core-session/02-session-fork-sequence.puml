@@ -1,0 +1,61 @@
+@startuml 02-session-fork-sequence
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowColor #1976D2
+skinparam sequenceActorBorderColor #426450ff
+skinparam sequenceParticipantBorderColor #6C757D
+skinparam SequenceParticipantBorderThickness 2
+skinparam sequenceLifeLineBorderColor #9bd0f5ff
+skinparam noteBackgroundColor #FFF3E0
+skinparam noteBorderColor #F57C00
+skinparam style strictuml
+skinparam Padding 6
+skinparam ParticipantPadding 30
+
+title 会话分叉（fork）流程
+
+actor 调用方 as Caller
+participant "SessionStore\n(core/session L791)" as Store
+participant "源 Session\n(L424)" as SrcSession
+database "源事件日志\n(JSONL/SQLite)" as SrcDB
+participant "子 Session\n(新创建)" as ChildSession
+database "子事件日志\n(新)" as ChildDB
+
+Caller -> Store: fork(source, boundary?, childSessionId?)
+activate Store
+
+Store -> SrcSession: 读取事件流到 boundary
+activate SrcSession
+SrcSession -> SrcDB: 读取 SessionEvent[]
+activate SrcDB
+SrcDB --> SrcSession: events[]
+deactivate SrcDB
+SrcSession --> Store: events[] + header
+deactivate SrcSession
+
+Store -> ChildSession: 创建子会话
+activate ChildSession
+note right of ChildSession
+  SessionHeader.parentSession
+  记录分叉谱系 (L74)
+end note
+
+Store -> ChildDB: 复制事件到子日志
+activate ChildDB
+ChildDB --> Store: 持久化确认
+deactivate ChildDB
+
+Store -> ChildSession: 追加 session/seed 标记
+ChildSession --> Store: 子 Session 实例
+deactivate ChildSession
+
+Store --> Caller: childSession
+deactivate Store
+
+note over Caller, ChildDB
+  分叉是事件流的快照复制：
+  - 子会话继承到 boundary 为止的事件
+  - parentSession 链记录谱系
+  - 子会话独立演化，可继续追加
+end note
+@enduml

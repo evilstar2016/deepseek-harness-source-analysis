@@ -1,0 +1,326 @@
+@startuml data-model-er
+!theme plain
+skinparam backgroundColor white
+skinparam classBackgroundColor #E3F2FD
+skinparam classBorderColor #1976D2
+skinparam arrowColor #424242
+
+title DeepSeek Harness 数据模型 ER 图
+
+' ===== 核心运行时模型 =====
+package "核心运行时模型 (packages/core/session)" as CoreModel #E8F5E9 {
+  entity "SessionHeader" as Header {
+    * version : number [SESSION_FORMAT_VERSION]
+    * id : SessionId
+    * createdAt : number
+    --
+    cwd : string (optional)
+    parentSession : SessionId (optional)
+    seedLength : number (optional)
+    origin : string (optional, "subagent")
+    delegationDepth : number (optional)
+    agentPreset : string (optional)
+  }
+
+  entity "SessionEvent" as Event {
+    * type : SessionEventType
+    * seq : number [monotonic]
+    * time : number
+    * data : SessionEventMap[K]
+    --
+    ignorable : boolean (optional)
+    sourceEventSeqs : number[] (optional)
+    surfaceOp : SurfaceOp (optional)
+  }
+
+  entity "Session" as Session {
+    * log : SessionEvent[]
+    * header : SessionHeader
+    * firstLiveSeq : number
+    --
+    eventsSnapshot : SessionEvent[] (optional)
+    surfaceManager : SurfaceManager
+    --
+    + append(type, data, surfaceIntent)
+    + deriveMessages()
+    + requestHeader()
+  }
+
+  entity "SessionStore" as Store {
+    * counter : number
+    * store : Map[SessionId, Session]
+    --
+    + create(id)
+    + prepare(id, options)
+    + fork(source, boundary, childId)
+    + enter() / detachEntered()
+    + flush()
+  }
+}
+
+' ===== SessionEventMap 事件类型 =====
+package "SessionEventMap 事件类型 (types.ts:235-332)" as EventTypes #FFF3E0 {
+  entity "生命周期边界" as LifeCycle {
+    turn/start : turn
+    turn/end : turn, reason
+    step/start : turn, step
+    step/end : turn, step
+  }
+
+  entity "模型可见表面" as Surface {
+    user/message : UserMessage
+    assistant/chunk : turn, step, chunk
+    assistant/message : turn, step, message, usage
+    tool/call : turn, step, callId, name, arguments
+    tool/result : turn, step, message, error, meta
+  }
+
+  entity "仅日志状态" as LogOnly {
+    todo/write : todos[]
+    request/header : header, reason
+    request/context : RequestContext
+  }
+
+  entity "种子标记" as Seed {
+    session/end-seed : Record[string, never]
+    (位置+time 承载含义)
+  }
+}
+
+' ===== SQLite 持久化表 =====
+package "SQLite 持久化表 (session-persistence-sqlite/schema.ts)" as SqliteModel #E3F2FD {
+  entity "persistence_state" as PSState {
+    * singleton : INTEGER PK [CHECK=1]
+    --
+    * store_id : TEXT
+  }
+
+  entity "sessions" as SessionsTbl {
+    * id : TEXT PK
+    * version : INTEGER
+    * created_at : INTEGER
+    --
+    cwd : TEXT
+    parent_session : TEXT
+    seed_length : INTEGER
+    origin : TEXT
+    delegation_depth : INTEGER
+    agent_preset : TEXT
+    * incarnation : TEXT
+    * revision : INTEGER
+  }
+
+  entity "events" as EventsTbl {
+    * session_id : TEXT FK [sessions.id]
+    * seq : INTEGER
+    --
+    * type : TEXT
+    * time : INTEGER
+    * data : TEXT [JSON]
+    source_event_seqs : TEXT [JSON number[]]
+    surface_op : TEXT [JSON SurfaceOp]
+    ignorable : INTEGER
+    --
+    PK (session_id, seq)
+  }
+}
+
+' ===== JSONL 文件格式 =====
+package "JSONL 文件格式 (session-persistence-jsonl/format.ts)" as JsonlModel #FFF9C4 {
+  entity "HeaderLine" as HLine {
+    * type : "session"
+    * version : number
+    * id : SessionId
+    * createdAt : number
+    --
+    cwd : string (optional)
+    parentSession : SessionId (optional)
+    seedLength : number (optional)
+    origin : "subagent" (optional)
+    * delegationDepth : number [默认 0]
+    agentPreset : string (optional)
+  }
+
+  entity "event line" as ELine {
+    JSON.stringify(StorageRecord)
+    --
+    StorageRecord = SessionEvent
+    或 packed chunks row
+    (text-chunks / reasoning-chunks / tool-call-chunks)
+  }
+}
+
+' ===== 检索派生表 =====
+package "检索派生表 (session-query-sqlite/schema.ts)" as QueryModel #F3E5F5 {
+  entity "search_state" as SSState {
+    * singleton : INTEGER PK [CHECK=1]
+    --
+    * global_generation : INTEGER
+  }
+
+  entity "persisted_sessions" as PSessions {
+    * id : TEXT PK
+    * version : INTEGER
+    * created_at : INTEGER
+    --
+    cwd : TEXT
+    parent_session : TEXT
+    seed_length : INTEGER
+    delegation_depth : INTEGER
+    agent_preset : TEXT
+    * revision : TEXT
+    * generation : INTEGER
+  }
+
+  entity "persisted_docs (FTS5)" as PDocs {
+    text
+    session_id UNINDEXED
+    seq UNINDEXED
+    type UNINDEXED
+    time UNINDEXED
+    surface UNINDEXED
+    codepoint_length UNINDEXED
+    --
+    tokenize = unicode61
+  }
+
+  entity "live_sessions (TEMP)" as LSessions {
+    * id : TEXT PK
+    * fingerprint : TEXT
+    * persisted : INTEGER [0 or 1]
+    * generation : INTEGER
+    --
+    (header 字段同 persisted_sessions)
+  }
+
+  entity "live_docs (TEMP FTS5)" as LDocs {
+    (列同 persisted_docs)
+  }
+}
+
+' ===== 辅助存储模型 =====
+package "辅助存储模型" as AuxModel #FFEBEE {
+  entity "ImageAttachmentRef" as AttRef {
+    * attachmentId : AttachmentId [sha256:hex]
+    * mediaType : string
+    * width / height : number
+    * bytes : number
+    --
+    name : string (optional)
+  }
+
+  entity "ContentObject" as AttObj {
+    * sha256 : hex (64)
+    * path : objects/[前2位]/[sha256]
+    --
+    字节内容 (不可变)
+    mode : 0o600
+  }
+
+  entity "SpillFile" as SpillF {
+    * path : [root]/session-[hash12]/[rand]-[safeName]
+    * bytes : number
+    --
+    mode : 0o600
+  }
+
+  entity "ProjectionCheckpointRow" as ProjRow {
+    * ver : number [stateVersion]
+    * seq : number [watermark]
+    * val : unknown [plain JSON]
+    --
+    行键: (sessionId, key)
+    identity: log 身份绑定
+  }
+
+  entity "SettingsDocument" as SetDoc {
+    YAML/JSON
+    多命名空间 section
+    --
+    保留叶子级 diff
+    withFileLock + writeFileAtomic
+  }
+
+  entity "CredentialsDocument" as CredDoc {
+    CredentialRef -> string
+    (严格映射, 非 dotenv)
+    --
+    mode : 0600
+    分层: env > .credentials.yaml > cwd/.env > DSH_HOME/.env
+  }
+}
+
+' ===== 关系 =====
+Header ||--|{ Event : "1:N\n会话头 -> 事件流"
+Session ||--|| Header : "1:1"
+Session ||--|{ Event : "1:N\nlog 数组"
+Store ||--|{ Session : "1:N"
+
+Event --> EventTypes : "data 类型"
+
+' SQLite 表关系
+PSState ||--|| SessionsTbl : "store identity"
+SessionsTbl ||--|{ EventsTbl : "1:N\nON DELETE CASCADE"
+
+' JSONL 文件关系
+HLine ||--|{ ELine : "首行 -> 事件行"
+
+' 运行时 <-> 持久化映射
+Header ..> SessionsTbl : "rowToMeta\n(row <-> header)"
+Header ..> HLine : "toHeaderLine/fromHeaderLine"
+Event ..> EventsTbl : "rowToEvent\n(envelopeBindings)"
+Event ..> ELine : "eventLines\n(packChunkRuns)"
+
+' 检索派生表关系
+SSState ||--|| PSessions : "global generation"
+PSessions ||--|{ PDocs : "1:N\n(session_id)"
+LSessions ||--|{ LDocs : "1:N\n(session_id)"
+PSessions ..> SessionsTbl : "派生自\n持久化会话"
+LSessions ..> Session : "派生自\nlive 会话"
+
+' 辅助存储关系
+AttRef ||--|| AttObj : "引用 -> 内容\n(digest 校验)"
+Session ||--|{ AttRef : "会话引用附件"
+Session ||--|{ SpillF : "会话作用域"
+Session ||--|{ ProjRow : "投影检查点\n(per session, per key)"
+ProjRow ..> Storage : "session_projcache\ndomain"
+
+' 跨存储关系
+Store ..> SqliteModel : "SqliteSessionPersistence\n持久化"
+Store ..> JsonlModel : "JsonlSessionPersistence\n持久化"
+Store ..> QueryModel : "SqliteSessionQueryEngine\n派生检索"
+
+note bottom of Event
+  **事件信封**:
+  - seq 单调递增 (log.length)
+  - data 经 isJsonValue 校验
+  - deepFreeze 不可变
+  - ignorable: 缺省=required
+    (不识别必拒绝重建)
+end note
+
+note bottom of SessionsTbl
+  **关键设计**:
+  - 惰性物化: 首次 append 才写行
+  - incarnation: randomUUID() 稳定身份
+  - revision: 每变更事务 +1
+  - STRICT 表
+end note
+
+note bottom of EventsTbl
+  **撕裂尾修复 (scanRows)**:
+  - 最后 turn/end 之后的洞容忍
+  - 之前的洞抛错 (已提交损坏)
+  - tornFrom: 物理删除起点
+end note
+
+note bottom of AttObj
+  **内容寻址**:
+  - ID = sha256(bytes)
+  - link() dedup (EEXIST 校验 digest)
+  - syncDirectory 关闭并发窗口
+  - POSIX: dir fsync
+  - Windows: NTFS 元数据日志
+end note
+
+@enduml

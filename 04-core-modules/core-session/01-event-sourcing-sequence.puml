@@ -1,0 +1,69 @@
+@startuml 01-event-sourcing-sequence
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowColor #1976D2
+skinparam sequenceActorBorderColor #426450ff
+skinparam sequenceParticipantBorderColor #6C757D
+skinparam SequenceParticipantBorderThickness 2
+skinparam sequenceLifeLineBorderColor #9bd0f5ff
+skinparam noteBackgroundColor #FFF3E0
+skinparam noteBorderColor #F57C00
+skinparam style strictuml
+skinparam Padding 6
+skinparam ParticipantPadding 30
+
+title 会话事件溯源：追加 → 派生 → 持久化
+
+actor 用户 as User
+participant "AgentLoop\n(agent-loop)" as Loop
+participant "Session\n(core/session L424)" as Session
+participant "SessionStore\n(L791)" as Store
+database "JSONL/SQLite\n(session/ 持久化)" as DB
+participant "SessionQuery\n(FTS 检索)" as Query
+
+User -> Loop: followup(content)
+activate Loop
+
+Loop -> Session: append(user/message)
+activate Session
+note right of Session
+  snapshotJsonValue 拒绝
+  非可序列化数据 (L603-654)
+end note
+Session -> Store: 事件入日志
+Store -> DB: 追加持久化
+activate DB
+DB --> Store: 写透确认
+deactivate DB
+Session --> Loop: SessionEvent
+deactivate Session
+
+Loop -> Loop: agent/pre-step (waterfall)
+Loop -> Session: append(step/start)
+Loop -> Session: deriveMessages()
+activate Session
+note right of Session
+  从事件流派生模型历史
+  raw chunk 保留回放保真
+end note
+Session --> Loop: model history
+deactivate Session
+
+Loop -> Session: append(assistant/chunk)*
+Loop -> Session: append(assistant/message)
+Loop -> Session: append(tool/call)*
+
+Loop -> Session: append(tool/result)*
+Loop -> Session: append(step/end)
+Loop -> Session: append(turn/end)
+
+== 检索阶段 ==
+Query -> DB: 读取事件流
+activate Query
+DB --> Query: SessionEvent[]
+Query -> Query: FTS5 索引同步
+Query --> User: 检索结果
+deactivate Query
+
+deactivate Loop
+@enduml
